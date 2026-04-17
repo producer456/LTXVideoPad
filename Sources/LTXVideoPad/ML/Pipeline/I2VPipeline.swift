@@ -12,6 +12,7 @@ import Foundation
 import MLX
 import MLXNN
 import MLXRandom
+import Tokenizers
 import os
 
 public class I2VPipeline {
@@ -44,7 +45,26 @@ public class I2VPipeline {
         self.numSteps = numSteps
     }
 
-    /// Run the full I2V pipeline.
+    /// Run the full I2V pipeline with a text prompt.
+    /// Tokenizes the prompt internally using the T5 tokenizer.
+    /// - Parameters:
+    ///   - prompt: text description of the desired video
+    ///   - progress: callback (step, totalSteps, description)
+    /// - Returns: video frames [F, H, W, 3] in [0, 1]
+    public func generate(
+        prompt: String,
+        progress: ((Int, Int, String) -> Void)? = nil
+    ) async throws -> MLXArray {
+        // Tokenize the prompt
+        logger.info("Tokenizing prompt: \"\(prompt)\"")
+        let tokenizer: Tokenizer = try T5TokenizerLoader.load(from: t5Dir)
+        let tokenIds: [Int32] = T5TokenizerLoader.encode(tokenizer: tokenizer, text: prompt)
+        logger.info("Token IDs (first 10): \(Array(tokenIds.prefix(10)))")
+
+        return try await generate(tokenIds: tokenIds, progress: progress)
+    }
+
+    /// Run the full I2V pipeline with pre-tokenized IDs.
     /// - Parameters:
     ///   - tokenIds: pre-tokenized prompt as [Int32] (max 128 tokens)
     ///   - progress: callback (step, totalSteps, description)
@@ -144,6 +164,17 @@ public class I2VPipeline {
 
         let sampler = FlowMatchSampler(numSteps: numSteps)
 
+        // Compute 3D RoPE once for all steps
+        // Peak memory: negligible (~few KB for position embeddings)
+        let rope: MLXArray = RoPE3D.build(
+            framesF: latentF,
+            heightH: latentH,
+            widthW: latentW,
+            headDim: 64  // DiTConfig.v096.headDim
+        )
+        eval(rope)
+        logger.info("3D RoPE: \(rope.shape)")
+
         // Start from noise
         var latents = noise
 
@@ -156,11 +187,12 @@ public class I2VPipeline {
 
             let timestep = MLXArray([sigma * 1000.0])
 
-            // DiT forward: predict velocity
+            // DiT forward: predict velocity (with 3D RoPE)
             let velocity = model(
                 latents: latents,
                 textEmbeds: textEmbeddings,
-                timestep: timestep
+                timestep: timestep,
+                rope: rope
             )
             eval(velocity)
 

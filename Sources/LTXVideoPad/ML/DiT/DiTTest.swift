@@ -48,8 +48,14 @@ public struct DiTTest {
         print("  Text shape: \(textEmbeds.shape)")
         print("  Timestep shape: \(timestep.shape)")
 
+        // Compute 3D RoPE for the test latent dimensions (7 frames, 10 height, 16 width)
+        let rope: MLXArray = RoPE3D.build(framesF: 7, heightH: 10, widthW: 16, headDim: 64)
+        eval(rope)
+        print("  RoPE shape: \(rope.shape)")
+
         let startTime: Date = Date()
-        let output: MLXArray = model(latents: latents, textEmbeds: textEmbeds, timestep: timestep)
+        let output: MLXArray = model(latents: latents, textEmbeds: textEmbeds,
+                                      timestep: timestep, rope: rope)
         eval(output)
         let elapsed: Double = Date().timeIntervalSince(startTime)
 

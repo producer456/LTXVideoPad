@@ -194,13 +194,16 @@ public class DiTAttention: Module {
     }
 
     /// Apply rotary position embeddings.
+    /// x: [B, heads, seqLen, headDim]
+    /// freqs: [1, seqLen, halfDim, 2] where last dim is (cos, sin)
     private func applyRoPE(_ x: MLXArray, freqs: MLXArray) -> MLXArray {
         let halfDim: Int = headDim / 2
-        let x1: MLXArray = x[0..., 0..., 0..., 0..<halfDim]
-        let x2: MLXArray = x[0..., 0..., 0..., halfDim...]
+        let x1: MLXArray = x[0..., 0..., 0..., 0..<halfDim]   // [B, heads, seqLen, halfDim]
+        let x2: MLXArray = x[0..., 0..., 0..., halfDim...]     // [B, heads, seqLen, halfDim]
 
-        let cos_: MLXArray = freqs[0..., 0..., 0]
-        let sin_: MLXArray = freqs[0..., 0..., 1]
+        // freqs: [1, seqLen, halfDim, 2] → extract cos/sin as [1, 1, seqLen, halfDim]
+        let cos_: MLXArray = freqs[0..., 0..., 0..., 0].reshaped(1, 1, -1, halfDim)
+        let sin_: MLXArray = freqs[0..., 0..., 0..., 1].reshaped(1, 1, -1, halfDim)
 
         let out1: MLXArray = x1 * cos_ - x2 * sin_
         let out2: MLXArray = x2 * cos_ + x1 * sin_
@@ -343,9 +346,11 @@ public class LTXDiffusionModel: Module {
     ///   - latents: [B, seqLen, inChannels] flattened noisy latents
     ///   - textEmbeds: [B, textLen, captionChannels] T5 embeddings
     ///   - timestep: [B] timestep values
+    ///   - rope: precomputed 3D RoPE [1, seqLen, headDim/2, 2] (optional but recommended)
     /// - Returns: [B, seqLen, outChannels] predicted velocity
     public func callAsFunction(latents: MLXArray, textEmbeds: MLXArray,
-                                timestep: MLXArray) -> MLXArray {
+                                timestep: MLXArray,
+                                rope: MLXArray? = nil) -> MLXArray {
         // Project latents to inner dim
         var hidden: MLXArray = patchify_proj(latents)
 
@@ -354,9 +359,6 @@ public class LTXDiffusionModel: Module {
 
         // Timestep -> adaLN parameters
         let adaln: MLXArray = adaln_single(timestep)
-
-        // TODO: Compute 3D RoPE frequencies from latent spatial dims
-        let rope: MLXArray? = nil
 
         // Transformer blocks
         for block in transformer_blocks {
@@ -385,8 +387,10 @@ public class LTXDiffusionModelWrapper: Module {
     }
 
     public func callAsFunction(latents: MLXArray, textEmbeds: MLXArray,
-                                timestep: MLXArray) -> MLXArray {
-        return diffusion_model(latents: latents, textEmbeds: textEmbeds, timestep: timestep)
+                                timestep: MLXArray,
+                                rope: MLXArray? = nil) -> MLXArray {
+        return diffusion_model(latents: latents, textEmbeds: textEmbeds,
+                               timestep: timestep, rope: rope)
     }
 }
 
@@ -399,7 +403,9 @@ public class LTXVideoTransformer: Module {
     }
 
     public func callAsFunction(latents: MLXArray, textEmbeds: MLXArray,
-                                timestep: MLXArray) -> MLXArray {
-        return model(latents: latents, textEmbeds: textEmbeds, timestep: timestep)
+                                timestep: MLXArray,
+                                rope: MLXArray? = nil) -> MLXArray {
+        return model(latents: latents, textEmbeds: textEmbeds,
+                     timestep: timestep, rope: rope)
     }
 }

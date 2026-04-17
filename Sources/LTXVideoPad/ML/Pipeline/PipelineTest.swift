@@ -20,13 +20,13 @@ public struct PipelineTest {
             numFrames: 49, height: 320, width: 512, numSteps: 2  // 2 steps for fast test
         )
 
-        // Dummy token IDs (would come from tokenizer in real usage)
-        let tokenIds: [Int32] = [3, 9, 1712, 3, 1536, 30, 3084, 1]  // "a cat walking on grass"
+        // Use real tokenizer — prompt will be tokenized internally
+        let prompt = "a cat walking on grass"
 
         let startTime = Date()
 
         do {
-            let frames = try await pipeline.generate(tokenIds: tokenIds) { step, total, desc in
+            let frames = try await pipeline.generate(prompt: prompt) { step, total, desc in
                 print("  [\(step)/\(total)] \(desc)")
             }
 
