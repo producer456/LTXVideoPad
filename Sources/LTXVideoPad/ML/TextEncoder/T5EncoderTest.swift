@@ -1,105 +1,66 @@
-// T5EncoderTest.swift
-//
-// Phase 1 validation: load quantized T5-XXL, tokenize a prompt, forward pass,
-// verify output shape is [1, 128, 4096].
-//
-// Call from the app: await T5EncoderTest.run(modelDir: URL)
+// T5EncoderTest.swift — Phase 1 validation
+// Loads quantized T5-XXL, runs forward pass with dummy tokens,
+// verifies output shape [1, 128, 4096].
 
 import Foundation
 import MLX
 import MLXNN
-import Tokenizers
-import Hub
 import os
 
 public struct T5EncoderTest {
     private static let logger = Logger(subsystem: "com.ltxvideopad", category: "T5Test")
 
     public static func run(modelDir: URL) async {
-        logger.info("=== T5 Encoder Phase 1 Test ===")
-        logger.info("Model directory: \(modelDir.path)")
-
-        let memMgr: MemoryManager = MemoryManager.shared
-        memMgr.logMemory(context: "Before test")
-
-        // Step 1: Tokenize test prompt
-        logger.info("Step 1: Tokenizing...")
-        let testPrompt: String = "a cat walking on grass"
-
-        let tokenizerFile: URL = modelDir.appendingPathComponent("tokenizer.json")
-        guard FileManager.default.fileExists(atPath: tokenizerFile.path) else {
-            logger.error("tokenizer.json not found at \(tokenizerFile.path)")
-            return
-        }
-
-        let tokenizer: Tokenizer
-        do {
-            let tokConfig: URL = modelDir.appendingPathComponent("tokenizer_config.json")
-            let config = LanguageModelConfigurationFromHub(modelFolder: modelDir)
-            tokenizer = try await AutoTokenizer.from(modelFolder: modelDir)
-        } catch {
-            logger.error("Failed to load tokenizer: \(error)")
-            return
-        }
-
-        let encoded = tokenizer.encode(text: testPrompt)
-        var tokenIds: [Int32] = encoded.map { Int32($0) }
-        tokenIds.append(1) // EOS token
-        let maxLen: Int = 128
-
-        // Pad to maxLen
-        while tokenIds.count < maxLen {
-            tokenIds.append(0) // PAD
-        }
-        if tokenIds.count > maxLen {
-            tokenIds = Array(tokenIds.prefix(maxLen))
-        }
-
-        logger.info("Tokenized '\(testPrompt)' -> \(encoded.count) tokens + EOS, padded to \(maxLen)")
-
-        // Step 2: Create model
-        logger.info("Step 2: Creating T5EncoderModel...")
-        memMgr.willLoad(model: "T5-XXL")
+        print("Step 1: Creating T5EncoderModel...")
 
         let model: T5EncoderModel = T5EncoderModel()
-        logger.info("Model created with 24 layers")
+        print("  Model created (24 blocks, d_model=4096)")
 
-        // Step 3: Load weights
-        logger.info("Step 3: Loading quantized weights...")
+        // Step 2: Load weights
+        print("Step 2: Loading quantized weights from \(modelDir.path)...")
         do {
             try loadT5Weights(model: model, from: modelDir)
+            print("  Weights loaded successfully")
         } catch {
-            logger.error("Failed to load weights: \(error)")
-            memMgr.didUnload(model: "T5-XXL")
+            print("  ERROR loading weights: \(error)")
             return
         }
-        memMgr.logMemory(context: "After weight load")
 
-        // Step 4: Forward pass
-        logger.info("Step 4: Running forward pass...")
+        print("  Memory after load: \(MemoryManager.shared.currentMemoryMB) MB")
+
+        // Step 3: Forward pass with dummy tokens
+        // Using hardcoded token IDs to avoid tokenizer dependency for now
+        // "a cat" ≈ tokens [3, 9, 1712, 1] (approximate T5 tokenization)
+        print("Step 3: Running forward pass...")
+
+        let maxLen: Int = 128
+        var tokenIds: [Int32] = [3, 9, 1712, 1]  // dummy tokens + EOS
+        while tokenIds.count < maxLen {
+            tokenIds.append(0)  // PAD
+        }
+
         let inputIds: MLXArray = MLXArray(tokenIds).reshaped(1, maxLen)
+        print("  Input shape: \(inputIds.shape)")
 
         let startTime: Date = Date()
         let output: MLXArray = model(inputIds)
         eval(output)
         let elapsed: Double = Date().timeIntervalSince(startTime)
 
-        // Step 5: Validate
+        // Step 4: Validate
         let shape: [Int] = output.shape
         let expected: [Int] = [1, maxLen, 4096]
 
-        logger.info("Output shape: \(shape)")
-        logger.info("Expected:     \(expected)")
-        logger.info("Time: \(String(format: "%.2f", elapsed))s")
+        print("Step 4: Validation")
+        print("  Output shape: \(shape)")
+        print("  Expected:     \(expected)")
+        print("  Time: \(String(format: "%.2f", elapsed))s")
+        print("  Memory: \(MemoryManager.shared.currentMemoryMB) MB")
 
         if shape == expected {
-            logger.info("PASS")
+            print("  ✅ PASS — output shape matches")
         } else {
-            logger.error("FAIL: shape mismatch")
+            print("  ❌ FAIL — shape mismatch")
         }
-
-        memMgr.didUnload(model: "T5-XXL")
-        logger.info("=== Test Complete ===")
     }
 }
-
