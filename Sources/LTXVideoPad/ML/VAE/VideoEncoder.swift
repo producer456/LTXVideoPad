@@ -3,11 +3,11 @@
 // LTX-Video VAE Encoder: image/video → latent space.
 // Patchify → Conv3d → 4 DownBlocks → MidBlock → Conv_out → mean/logvar
 //
+// Property names match safetensors weight keys exactly.
+// Key prefix: "encoder."
+//
 // Input:  [B, 3, F, H, W] video (normalized to [-1, 1])
 // Output: [B, 128, (F-1)/8+1, H/32, W/32] latent
-//
-// For I2V, input is a single frame: [B, 3, 1, H, W]
-// Output: [B, 128, 1, H/32, W/32]
 //
 // Memory estimate at FP16: ~361 MB for encoder weights.
 // Peak during forward: ~600 MB (weights + activations for 512x320).
@@ -16,45 +16,47 @@ import Foundation
 import MLX
 import MLXNN
 
-// MARK: - Down Block
+// MARK: - Encoder Down Block
 
-/// Encoder down block: N ResNet blocks + optional strided downsample.
+/// Encoder down block with property names matching safetensors keys:
+///   resnets[i].conv{1,2}.conv.{weight,bias}
+///   downsamplers[0].conv.{weight,bias}           (CausalConv3d)
+///   conv_out.conv{1,2}.conv.{w,b}                (ChannelProjection)
+///   conv_out.conv_shortcut.conv.{w,b}
+///   conv_out.norm3.{weight,bias}
 public class DownBlock3D: Module {
     let resnets: [ResnetBlock3D]
-    let downsampler: CausalConv3d?
-    let convOut: ResnetBlock3D?
+    let downsamplers: [CausalConv3d]
+    // swiftlint:disable:next identifier_name
+    let conv_out: ChannelProjection?
 
-    /// - Parameters:
-    ///   - inChannels: input channel count
-    ///   - outChannels: output channel count (may differ from inChannels)
-    ///   - numLayers: number of ResNet blocks
-    ///   - downsample: whether to include a stride-2 downsample
-    ///   - causal: use causal temporal padding
     public init(inChannels: Int, outChannels: Int, numLayers: Int,
                 downsample: Bool, causal: Bool = true) {
 
         // ResNet blocks operate at inChannels
         var blocks: [ResnetBlock3D] = []
         for _ in 0..<numLayers {
-            blocks.append(ResnetBlock3D(inChannels: inChannels, outChannels: inChannels, causal: causal))
+            blocks.append(ResnetBlock3D(inChannels: inChannels, outChannels: inChannels,
+                                         causal: causal))
         }
         self.resnets = blocks
 
-        // Downsample with stride-2 conv
+        // Downsample with stride-2 conv (wrapped in array for key path downsamplers.0)
         if downsample {
-            self.downsampler = CausalConv3d(
-                inChannels: inChannels, outChannels: inChannels,
-                kernelSize: 3, stride: (2, 2, 2), causal: causal
-            )
+            self.downsamplers = [
+                CausalConv3d(inChannels: inChannels, outChannels: inChannels,
+                             kernelSize: 3, stride: (2, 2, 2), causal: causal)
+            ]
         } else {
-            self.downsampler = nil
+            self.downsamplers = []
         }
 
         // Channel projection if in != out
         if inChannels != outChannels {
-            self.convOut = ResnetBlock3D(inChannels: inChannels, outChannels: outChannels, causal: causal)
+            self.conv_out = ChannelProjection(inChannels: inChannels, outChannels: outChannels,
+                                              causal: causal)
         } else {
-            self.convOut = nil
+            self.conv_out = nil
         }
     }
 
@@ -63,10 +65,10 @@ public class DownBlock3D: Module {
         for resnet in resnets {
             h = resnet(h)
         }
-        if let ds = downsampler {
+        for ds in downsamplers {
             h = ds(h)
         }
-        if let co = convOut {
+        if let co = conv_out {
             h = co(h)
         }
         return h
@@ -75,14 +77,16 @@ public class DownBlock3D: Module {
 
 // MARK: - Mid Block
 
-/// Mid block: N ResNet blocks at the bottleneck (512 channels).
+/// Mid block: N ResNet blocks at the bottleneck.
+/// Key path: mid_block.resnets[i].conv{1,2}.conv.{weight,bias}
 public class MidBlock3D: Module {
     let resnets: [ResnetBlock3D]
 
     public init(channels: Int, numLayers: Int, causal: Bool = true) {
         var blocks: [ResnetBlock3D] = []
         for _ in 0..<numLayers {
-            blocks.append(ResnetBlock3D(inChannels: channels, outChannels: channels, causal: causal))
+            blocks.append(ResnetBlock3D(inChannels: channels, outChannels: channels,
+                                         causal: causal))
         }
         self.resnets = blocks
     }
@@ -98,15 +102,25 @@ public class MidBlock3D: Module {
 
 // MARK: - Video Encoder
 
-/// Complete LTX-Video encoder: patchify → conv_in → down_blocks → mid → conv_out
+/// Complete LTX-Video encoder: patchify → conv_in → down_blocks → mid_block → conv_out
+///
+/// Property names match safetensors key prefix "encoder.":
+///   conv_in.conv.{weight,bias}
+///   down_blocks[i].*
+///   mid_block.resnets[i].*
+///   conv_out.conv.{weight,bias}
 ///
 /// Peak memory (FP16): ~600 MB for 512x320 single-frame encoding.
 public class VideoEncoder: Module {
-    let convIn: CausalConv3d
-    let downBlocks: [DownBlock3D]
-    let midBlock: MidBlock3D
+    // swiftlint:disable:next identifier_name
+    let conv_in: CausalConv3d
+    // swiftlint:disable:next identifier_name
+    let down_blocks: [DownBlock3D]
+    // swiftlint:disable:next identifier_name
+    let mid_block: MidBlock3D
     let normOut: VAERMSNorm
-    let convOut: CausalConv3d
+    // swiftlint:disable:next identifier_name
+    let conv_out: CausalConv3d
 
     let patchSize: Int
     let latentChannels: Int  // 128
@@ -114,9 +128,6 @@ public class VideoEncoder: Module {
     public init(
         inChannels: Int = 3,
         latentChannels: Int = 128,
-        blockOutChannels: [Int] = [128, 256, 512, 512],
-        layersPerBlock: [Int] = [4, 3, 3, 3, 4],  // first = mid, rest = down blocks
-        spatioTemporalScaling: [Bool] = [true, true, true, false],
         patchSize: Int = 4
     ) {
         self.patchSize = patchSize
@@ -124,34 +135,33 @@ public class VideoEncoder: Module {
 
         let patchedChannels: Int = inChannels * patchSize * patchSize  // 3 * 4 * 4 = 48
 
-        // conv_in: patchified channels → first block channels
-        self.convIn = CausalConv3d(inChannels: patchedChannels, outChannels: blockOutChannels[0],
-                                    kernelSize: 3, causal: true)
-
-        // Down blocks
-        var blocks: [DownBlock3D] = []
-        var currentChannels: Int = blockOutChannels[0]
-        for i in 0..<blockOutChannels.count {
-            let outCh: Int = blockOutChannels[i]
-            let numLayers: Int = layersPerBlock[i + 1]  // offset by 1 (first is mid)
-            let downsample: Bool = spatioTemporalScaling[i]
-            blocks.append(DownBlock3D(
-                inChannels: currentChannels, outChannels: outCh,
-                numLayers: numLayers, downsample: downsample, causal: true
-            ))
-            currentChannels = outCh
-        }
-        self.downBlocks = blocks
-
-        // Mid block
-        self.midBlock = MidBlock3D(channels: currentChannels,
-                                    numLayers: layersPerBlock[0], causal: true)
-
-        // Output: norm + conv to latent channels (128 mean + 1 logvar = 129)
-        self.normOut = VAERMSNorm()
-        self.convOut = CausalConv3d(inChannels: currentChannels,
-                                     outChannels: latentChannels + 1,  // 129
+        // conv_in: patchified channels → 128
+        self.conv_in = CausalConv3d(inChannels: patchedChannels, outChannels: 128,
                                      kernelSize: 3, causal: true)
+
+        // Down blocks — structure from safetensors:
+        // block 0: 4 resnets @ 128, downsample, project 128→256
+        // block 1: 3 resnets @ 256, downsample, project 256→512
+        // block 2: 3 resnets @ 512, downsample, no projection
+        // block 3: 3 resnets @ 512, no downsample, no projection
+        self.down_blocks = [
+            DownBlock3D(inChannels: 128, outChannels: 256, numLayers: 4,
+                        downsample: true, causal: true),
+            DownBlock3D(inChannels: 256, outChannels: 512, numLayers: 3,
+                        downsample: true, causal: true),
+            DownBlock3D(inChannels: 512, outChannels: 512, numLayers: 3,
+                        downsample: true, causal: true),
+            DownBlock3D(inChannels: 512, outChannels: 512, numLayers: 3,
+                        downsample: false, causal: true),
+        ]
+
+        // Mid block: 4 resnets @ 512
+        self.mid_block = MidBlock3D(channels: 512, numLayers: 4, causal: true)
+
+        // Output: norm + conv to 129 channels (128 mean + 1 logvar)
+        self.normOut = VAERMSNorm()
+        self.conv_out = CausalConv3d(inChannels: 512, outChannels: latentChannels + 1,
+                                      kernelSize: 3, causal: true)
     }
 
     /// Encode video/image to latent space.
@@ -165,20 +175,18 @@ public class VideoEncoder: Module {
         h = patchify(h)
 
         // Encoder forward
-        h = convIn(h)
+        h = conv_in(h)
 
-        for block in downBlocks {
+        for block in down_blocks {
             h = block(h)
         }
 
-        h = midBlock(h)
+        h = mid_block(h)
         h = normOut(h)
         h = silu(h)
-        h = convOut(h)
+        h = conv_out(h)
 
-        // Split into mean and logvar
-        // Output has latentChannels + 1 channels; take first latentChannels as mean
-        // Transpose back to channels-first: [B, F', H', W', C] → [B, C, F', H', W']
+        // Transpose to channels-first: [B, F', H', W', C] → [B, C, F', H', W']
         h = h.transposed(0, 4, 1, 2, 3)
 
         // Take mean (first 128 channels), discard logvar (channel 129)
@@ -196,9 +204,7 @@ public class VideoEncoder: Module {
         let c: Int = x.dim(4)
         let p: Int = patchSize
 
-        // Reshape: [B, F, H/p, p, W/p, p, C] then merge patch dims into channels
         let reshaped: MLXArray = x.reshaped(b, f, h / p, p, w / p, p, c)
-        // Permute to [B, F, H/p, W/p, p, p, C] then flatten last 3 dims
         let permuted: MLXArray = reshaped.transposed(0, 1, 2, 4, 3, 5, 6)
         return permuted.reshaped(b, f, h / p, w / p, c * p * p)
     }

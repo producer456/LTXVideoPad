@@ -32,6 +32,15 @@ struct LTXVideoPadCLI {
             }
         }
 
+        if testName == "vae" || testName == "all" {
+            let vaeDir = baseDir.appendingPathComponent("Models/vae/vae")
+            if FileManager.default.fileExists(atPath: vaeDir.appendingPathComponent("diffusion_pytorch_model.safetensors").path) {
+                await VAETest.run(modelDir: vaeDir)
+            } else {
+                print("VAE weights not found — skipping")
+            }
+        }
+
         print("\nMemory: \(MemoryManager.shared.currentMemoryMB) MB")
     }
 }

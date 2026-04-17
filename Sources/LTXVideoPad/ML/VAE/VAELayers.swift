@@ -1,4 +1,5 @@
 // VAELayers.swift — Core building blocks for LTX-Video 3D Causal VAE
+// Property names match safetensors weight keys exactly for direct loading.
 // All convolution-based, no attention layers.
 
 import Foundation
@@ -24,6 +25,9 @@ public class VAERMSNorm: Module, UnaryLayer {
 
 /// 3D convolution with causal temporal padding (replicate first frame).
 /// Input/output in MLX channels-last format: [B, D, H, W, C]
+///
+/// The inner Conv3d is exposed as `.conv` so the weight key path
+/// `conv1.conv.weight` maps to `conv1.conv.weight` on the module tree.
 public class CausalConv3d: Module, UnaryLayer {
     let conv: Conv3d
     let causal: Bool
@@ -103,14 +107,13 @@ public class CausalConv3d: Module, UnaryLayer {
 // MARK: - ResNet Block 3D
 
 /// Two CausalConv3d layers with RMSNorm + SiLU, residual skip connection.
-/// Optional 1x1 shortcut conv when channels differ.
+/// Weight key paths:  conv1.conv.{weight,bias}, conv2.conv.{weight,bias}
+/// No learnable norm parameters (VAERMSNorm is parameter-free).
 public class ResnetBlock3D: Module {
     let norm1: VAERMSNorm
     let conv1: CausalConv3d
     let norm2: VAERMSNorm
     let conv2: CausalConv3d
-    let shortcut: CausalConv3d?
-    let shortcutNorm: LayerNorm?
 
     public init(inChannels: Int, outChannels: Int, causal: Bool = true) {
         self.norm1 = VAERMSNorm()
@@ -119,15 +122,6 @@ public class ResnetBlock3D: Module {
         self.norm2 = VAERMSNorm()
         self.conv2 = CausalConv3d(inChannels: outChannels, outChannels: outChannels,
                                    kernelSize: 3, causal: causal)
-
-        if inChannels != outChannels {
-            self.shortcut = CausalConv3d(inChannels: inChannels, outChannels: outChannels,
-                                          kernelSize: 1, stride: (1, 1, 1), causal: causal)
-            self.shortcutNorm = LayerNorm(dimensions: outChannels)
-        } else {
-            self.shortcut = nil
-            self.shortcutNorm = nil
-        }
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -137,13 +131,65 @@ public class ResnetBlock3D: Module {
         h = norm2(h)
         h = silu(h)
         h = conv2(h)
+        return h + x
+    }
+}
 
-        var skip: MLXArray = x
-        if let sc = shortcut, let sn = shortcutNorm {
-            skip = sc(x)
-            skip = sn(skip)
-        }
+// MARK: - Channel Projection Block
 
+/// ResNet-style block for channel changes between stages.
+/// Weight key paths: conv1.conv.{w,b}, conv2.conv.{w,b},
+///   conv_shortcut.conv.{w,b}, norm3.{weight,bias}
+/// Property names match safetensors keys: conv1, conv2, conv_shortcut, norm3.
+public class ChannelProjection: Module {
+    let norm1: VAERMSNorm
+    let conv1: CausalConv3d
+    let norm2: VAERMSNorm
+    let conv2: CausalConv3d
+    // swiftlint:disable:next identifier_name
+    let conv_shortcut: CausalConv3d
+    let norm3: LayerNorm
+
+    public init(inChannels: Int, outChannels: Int, causal: Bool = true) {
+        self.norm1 = VAERMSNorm()
+        self.conv1 = CausalConv3d(inChannels: inChannels, outChannels: outChannels,
+                                   kernelSize: 3, causal: causal)
+        self.norm2 = VAERMSNorm()
+        self.conv2 = CausalConv3d(inChannels: outChannels, outChannels: outChannels,
+                                   kernelSize: 3, causal: causal)
+        self.conv_shortcut = CausalConv3d(inChannels: inChannels, outChannels: outChannels,
+                                           kernelSize: 1, stride: (1, 1, 1), causal: causal)
+        self.norm3 = LayerNorm(dimensions: inChannels)
+    }
+
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let normed: MLXArray = norm3(x)
+
+        var h: MLXArray = norm1(normed)
+        h = silu(h)
+        h = conv1(h)
+        h = norm2(h)
+        h = silu(h)
+        h = conv2(h)
+
+        let skip: MLXArray = conv_shortcut(normed)
         return h + skip
+    }
+}
+
+// MARK: - Upsampler wrapper
+
+/// Wraps a CausalConv3d as `.conv` to match the safetensors key path
+/// `upsamplers.0.conv.conv.weight`.
+public class Upsampler: Module {
+    let conv: CausalConv3d
+
+    public init(inChannels: Int, outChannels: Int, causal: Bool = false) {
+        self.conv = CausalConv3d(inChannels: inChannels, outChannels: outChannels,
+                                  kernelSize: 3, causal: causal)
+    }
+
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        return conv(x)
     }
 }

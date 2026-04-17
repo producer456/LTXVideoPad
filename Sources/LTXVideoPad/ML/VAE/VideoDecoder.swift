@@ -3,11 +3,11 @@
 // LTX-Video VAE Decoder: latent space → video frames.
 // Conv_in → MidBlock → 4 UpBlocks → Conv_out → Unpatchify
 //
-// Input:  [B, 128, F', H', W'] latent
-// Output: [B, 3, F, H, W] video (F=49, H=320, W=512 at full res)
+// Property names match safetensors weight keys exactly.
+// Key prefix: "decoder."
 //
-// The decoder uses non-causal (symmetric) temporal padding.
-// Upsampling is done via depth-to-space (channel → spatial expansion).
+// Input:  [B, 128, F', H', W'] latent
+// Output: [B, 3, F, H, W] video
 //
 // Memory estimate at FP16: ~478 MB for decoder weights.
 // Peak during forward: ~800 MB (weights + activations for full video decode).
@@ -18,43 +18,48 @@ import MLXNN
 
 // MARK: - Up Block
 
-/// Decoder up block: optional channel projection + N ResNet blocks + optional upsample.
-/// Upsampling uses depth-to-space: conv to ch*8, then rearrange to 2x2x2 spatial expansion.
+/// Decoder up block with property names matching safetensors keys:
+///   conv_in.conv{1,2}.conv.{w,b}                 (ChannelProjection, optional)
+///   conv_in.conv_shortcut.conv.{w,b}
+///   conv_in.norm3.{weight,bias}
+///   resnets[i].conv{1,2}.conv.{weight,bias}
+///   upsamplers[0].conv.conv.{weight,bias}         (Upsampler → CausalConv3d)
 public class UpBlock3D: Module {
-    let convIn: ResnetBlock3D?       // channel projection (if needed)
+    // swiftlint:disable:next identifier_name
+    let conv_in: ChannelProjection?
     let resnets: [ResnetBlock3D]
-    let upsampleConv: CausalConv3d?  // ch → ch*8 for depth-to-space
+    let upsamplers: [Upsampler]
 
-    let inChannels: Int
     let outChannels: Int
 
     public init(inChannels: Int, outChannels: Int, numLayers: Int,
                 upsample: Bool, causal: Bool = false) {
-        self.inChannels = inChannels
         self.outChannels = outChannels
 
         // Channel projection if needed
         if inChannels != outChannels {
-            self.convIn = ResnetBlock3D(inChannels: inChannels, outChannels: outChannels, causal: causal)
+            self.conv_in = ChannelProjection(inChannels: inChannels, outChannels: outChannels,
+                                              causal: causal)
         } else {
-            self.convIn = nil
+            self.conv_in = nil
         }
 
         // ResNet blocks at outChannels
         var blocks: [ResnetBlock3D] = []
         for _ in 0..<numLayers {
-            blocks.append(ResnetBlock3D(inChannels: outChannels, outChannels: outChannels, causal: causal))
+            blocks.append(ResnetBlock3D(inChannels: outChannels, outChannels: outChannels,
+                                         causal: causal))
         }
         self.resnets = blocks
 
-        // Upsample via depth-to-space
+        // Upsample via depth-to-space (ch → ch*8, then rearrange)
         if upsample {
-            self.upsampleConv = CausalConv3d(
-                inChannels: outChannels, outChannels: outChannels * 8,
-                kernelSize: 3, causal: causal
-            )
+            self.upsamplers = [
+                Upsampler(inChannels: outChannels, outChannels: outChannels * 8,
+                          causal: causal)
+            ]
         } else {
-            self.upsampleConv = nil
+            self.upsamplers = []
         }
     }
 
@@ -62,7 +67,7 @@ public class UpBlock3D: Module {
         var h: MLXArray = x
 
         // Channel projection
-        if let ci = convIn {
+        if let ci = conv_in {
             h = ci(h)
         }
 
@@ -72,8 +77,8 @@ public class UpBlock3D: Module {
         }
 
         // Upsample via depth-to-space
-        if let usConv = upsampleConv {
-            h = usConv(h)
+        for us in upsamplers {
+            h = us(h)
             h = depthToSpace3D(h, blockSize: 2)
         }
 
@@ -89,26 +94,33 @@ public class UpBlock3D: Module {
         let w: Int = x.dim(3)
         let c: Int = x.dim(4) / (s * s * s)
 
-        // Reshape: [B, D, H, W, s, s, s, C]
         let reshaped: MLXArray = x.reshaped(b, d, h, w, s, s, s, c)
-        // Permute: [B, D, s, H, s, W, s, C]
         let permuted: MLXArray = reshaped.transposed(0, 1, 4, 2, 5, 3, 6, 7)
-        // Merge: [B, D*s, H*s, W*s, C]
         return permuted.reshaped(b, d * s, h * s, w * s, c)
     }
 }
 
 // MARK: - Video Decoder
 
-/// Complete LTX-Video decoder: conv_in → mid → up_blocks → norm → conv_out → unpatchify
+/// Complete LTX-Video decoder: conv_in → mid_block → up_blocks → norm → conv_out → unpatchify
+///
+/// Property names match safetensors key prefix "decoder.":
+///   conv_in.conv.{weight,bias}
+///   mid_block.resnets[i].*
+///   up_blocks[i].*
+///   conv_out.conv.{weight,bias}
 ///
 /// Peak memory (FP16): ~800 MB for full 49-frame video decode.
 public class VideoDecoder: Module {
-    let convIn: CausalConv3d
-    let midBlock: MidBlock3D
-    let upBlocks: [UpBlock3D]
+    // swiftlint:disable:next identifier_name
+    let conv_in: CausalConv3d
+    // swiftlint:disable:next identifier_name
+    let mid_block: MidBlock3D
+    // swiftlint:disable:next identifier_name
+    let up_blocks: [UpBlock3D]
     let normOut: VAERMSNorm
-    let convOut: CausalConv3d
+    // swiftlint:disable:next identifier_name
+    let conv_out: CausalConv3d
 
     let patchSize: Int
     let outChannels: Int  // 3
@@ -116,47 +128,39 @@ public class VideoDecoder: Module {
     public init(
         outChannels: Int = 3,
         latentChannels: Int = 128,
-        blockOutChannels: [Int] = [128, 256, 512, 512],
-        layersPerBlock: [Int] = [4, 3, 3, 3, 4],  // first = mid, rest = up blocks
-        spatioTemporalScaling: [Bool] = [true, true, true, false],
         patchSize: Int = 4
     ) {
         self.patchSize = patchSize
         self.outChannels = outChannels
 
-        let bottleneckChannels: Int = blockOutChannels.last!  // 512
-
-        // conv_in: latent channels → bottleneck
-        self.convIn = CausalConv3d(inChannels: latentChannels, outChannels: bottleneckChannels,
-                                    kernelSize: 3, causal: false)  // decoder is non-causal
-
-        // Mid block
-        self.midBlock = MidBlock3D(channels: bottleneckChannels,
-                                    numLayers: layersPerBlock[0], causal: false)
-
-        // Up blocks (reversed order from encoder)
-        let reversedChannels: [Int] = Array(blockOutChannels.reversed())
-        let reversedScaling: [Bool] = Array(spatioTemporalScaling.reversed())
-
-        var blocks: [UpBlock3D] = []
-        var currentChannels: Int = bottleneckChannels
-        for i in 0..<reversedChannels.count {
-            let outCh: Int = reversedChannels[i]
-            let numLayers: Int = layersPerBlock[i + 1]
-            let upsample: Bool = reversedScaling[i]
-            blocks.append(UpBlock3D(
-                inChannels: currentChannels, outChannels: outCh,
-                numLayers: numLayers, upsample: upsample, causal: false
-            ))
-            currentChannels = outCh
-        }
-        self.upBlocks = blocks
-
-        // Output: norm + conv to patched pixel channels
-        let patchedChannels: Int = outChannels * patchSize * patchSize  // 3 * 4 * 4 = 48
-        self.normOut = VAERMSNorm()
-        self.convOut = CausalConv3d(inChannels: currentChannels, outChannels: patchedChannels,
+        // conv_in: 128 latent → 512 bottleneck
+        self.conv_in = CausalConv3d(inChannels: latentChannels, outChannels: 512,
                                      kernelSize: 3, causal: false)
+
+        // Mid block: 4 resnets @ 512
+        self.mid_block = MidBlock3D(channels: 512, numLayers: 4, causal: false)
+
+        // Up blocks — structure from safetensors:
+        // block 0: 3 resnets @ 512, no conv_in, no upsampler
+        // block 1: 3 resnets @ 512, no conv_in, upsampler 512→4096
+        // block 2: conv_in 512→256, 3 resnets @ 256, upsampler 256→2048
+        // block 3: conv_in 256→128, 4 resnets @ 128, upsampler 128→1024
+        self.up_blocks = [
+            UpBlock3D(inChannels: 512, outChannels: 512, numLayers: 3,
+                      upsample: false, causal: false),
+            UpBlock3D(inChannels: 512, outChannels: 512, numLayers: 3,
+                      upsample: true, causal: false),
+            UpBlock3D(inChannels: 512, outChannels: 256, numLayers: 3,
+                      upsample: true, causal: false),
+            UpBlock3D(inChannels: 256, outChannels: 128, numLayers: 4,
+                      upsample: true, causal: false),
+        ]
+
+        // Output: norm + conv to patched pixel channels (3 * 4 * 4 = 48)
+        let patchedChannels: Int = outChannels * patchSize * patchSize
+        self.normOut = VAERMSNorm()
+        self.conv_out = CausalConv3d(inChannels: 128, outChannels: patchedChannels,
+                                      kernelSize: 3, causal: false)
     }
 
     /// Decode latent to video.
@@ -166,16 +170,16 @@ public class VideoDecoder: Module {
         // Transpose to channels-last: [B, F', H', W', C]
         var h: MLXArray = z.transposed(0, 2, 3, 4, 1)
 
-        h = convIn(h)
-        h = midBlock(h)
+        h = conv_in(h)
+        h = mid_block(h)
 
-        for block in upBlocks {
+        for block in up_blocks {
             h = block(h)
         }
 
         h = normOut(h)
         h = silu(h)
-        h = convOut(h)
+        h = conv_out(h)
 
         // Unpatchify: [B, F, H/p, W/p, C*p*p] → [B, F, H, W, C]
         h = unpatchify(h)
@@ -189,16 +193,13 @@ public class VideoDecoder: Module {
     private func unpatchify(_ x: MLXArray) -> MLXArray {
         let b: Int = x.dim(0)
         let f: Int = x.dim(1)
-        let hp: Int = x.dim(2)  // H / patchSize
-        let wp: Int = x.dim(3)  // W / patchSize
+        let hp: Int = x.dim(2)
+        let wp: Int = x.dim(3)
         let p: Int = patchSize
-        let c: Int = outChannels  // 3
+        let c: Int = outChannels
 
-        // Reshape: [B, F, H', W', p, p, C]
         let reshaped: MLXArray = x.reshaped(b, f, hp, wp, p, p, c)
-        // Permute: [B, F, H', p, W', p, C]
         let permuted: MLXArray = reshaped.transposed(0, 1, 2, 4, 3, 5, 6)
-        // Merge: [B, F, H'*p, W'*p, C]
         return permuted.reshaped(b, f, hp * p, wp * p, c)
     }
 }
