@@ -17,7 +17,7 @@ import MLXNN
 
 // MARK: - Configuration
 
-public struct T5Config {
+public struct T5Config: Sendable {
     public let vocabSize: Int
     public let dModel: Int
     public let dKV: Int
@@ -69,9 +69,9 @@ public class T5RelativePositionBiasEmbeddings: Module {
     }
 
     public func callAsFunction(queryLen: Int, keyLen: Int) -> MLXArray {
-        let contextPos: MLXArray = MLXArray(Array(0..<queryLen), dtype: .int32)
-        let memoryPos: MLXArray = MLXArray(Array(0..<keyLen), dtype: .int32)
-        let relativePosition: MLXArray = expandedDims(memoryPos, axis: 0) - expandedDims(contextPos, axis: 1)
+        let contextPos: MLXArray = MLXArray(Array(0..<queryLen).map { Int32($0) })
+        let memoryPos: MLXArray = MLXArray(Array(0..<keyLen).map { Int32($0) })
+        let relativePosition: MLXArray = expandedDimensions(memoryPos, axis: 0) - expandedDimensions(contextPos, axis: 1)
 
         let numBucketsHalf: Int = numBuckets / 2
         let maxExact: Int = numBucketsHalf / 2
@@ -92,7 +92,7 @@ public class T5RelativePositionBiasEmbeddings: Module {
         // Look up: [queryLen, keyLen] -> index into [numBuckets, numHeads]
         let flat: MLXArray = buckets.reshaped(-1)
         let values: MLXArray = weight[flat].reshaped(queryLen, keyLen, numHeads)
-        return expandedDims(values.transposed(2, 0, 1), axis: 0)
+        return expandedDimensions(values.transposed(2, 0, 1), axis: 0)
     }
 }
 

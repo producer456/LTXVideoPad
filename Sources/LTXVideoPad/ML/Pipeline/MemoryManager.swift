@@ -16,7 +16,7 @@ import Foundation
 import os
 
 /// Tracks memory usage and enforces sequential model loading.
-final class MemoryManager {
+final class MemoryManager: @unchecked Sendable {
     static let shared = MemoryManager()
 
     private let logger = Logger(subsystem: "com.ltxvideopad", category: "Memory")

@@ -9,6 +9,7 @@ import Foundation
 import MLX
 import MLXNN
 import Tokenizers
+import Hub
 import os
 
 public struct T5EncoderTest {
@@ -33,8 +34,9 @@ public struct T5EncoderTest {
 
         let tokenizer: Tokenizer
         do {
-            let tokData: Data = try Data(contentsOf: tokenizerFile)
-            tokenizer = try JSONDecoder().decode(TokenizerWrapper.self, from: tokData).tokenizer
+            let tokConfig: URL = modelDir.appendingPathComponent("tokenizer_config.json")
+            let config = LanguageModelConfigurationFromHub(modelFolder: modelDir)
+            tokenizer = try await AutoTokenizer.from(modelFolder: modelDir)
         } catch {
             logger.error("Failed to load tokenizer: \(error)")
             return
@@ -101,11 +103,3 @@ public struct T5EncoderTest {
     }
 }
 
-// Helper to decode tokenizer.json
-private struct TokenizerWrapper: Decodable {
-    let tokenizer: Tokenizer
-
-    init(from decoder: Decoder) throws {
-        self.tokenizer = try Tokenizer(from: decoder)
-    }
-}
