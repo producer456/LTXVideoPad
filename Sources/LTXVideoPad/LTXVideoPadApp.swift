@@ -1,5 +1,5 @@
-// LTXVideoPad — Phase 1 Test Runner
-// Runs T5 encoder test headless (no UI needed for validation)
+// LTXVideoPad — Test Runner
+// Runs Phase 1 (T5) and Phase 3 (DiT) tests sequentially.
 
 import Foundation
 import MLX
@@ -7,19 +7,31 @@ import MLX
 @main
 struct LTXVideoPadCLI {
     static func main() async {
-        print("=== LTXVideoPad — Phase 1 T5 Encoder Test ===")
-        print("Memory: \(MemoryManager.shared.currentMemoryMB) MB")
+        let baseDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 
-        let modelDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            .appendingPathComponent("Models/t5xxl-encoder-4bit")
+        let args = CommandLine.arguments
+        let testName = args.count > 1 ? args[1] : "all"
 
-        if !FileManager.default.fileExists(atPath: modelDir.appendingPathComponent("model.safetensors").path) {
-            print("ERROR: model.safetensors not found at \(modelDir.path)")
-            print("Run: python3 scripts/download_and_quantize_t5.py")
-            return
+        if testName == "t5" || testName == "all" {
+            let t5Dir = baseDir.appendingPathComponent("Models/t5xxl-encoder-4bit")
+            if FileManager.default.fileExists(atPath: t5Dir.appendingPathComponent("model.safetensors").path) {
+                print("\n=== T5 Encoder Test ===")
+                await T5EncoderTest.run(modelDir: t5Dir)
+            } else {
+                print("T5 weights not found — skipping")
+            }
         }
 
-        print("Model directory: \(modelDir.path)")
-        await T5EncoderTest.run(modelDir: modelDir)
+        if testName == "dit" || testName == "all" {
+            let ditDir = baseDir.appendingPathComponent("Models/dit-4bit")
+            if FileManager.default.fileExists(atPath: ditDir.appendingPathComponent("model.safetensors").path) {
+                print("\n=== DiT Backbone Test ===")
+                await DiTTest.run(modelDir: ditDir)
+            } else {
+                print("DiT weights not found — skipping")
+            }
+        }
+
+        print("\nMemory: \(MemoryManager.shared.currentMemoryMB) MB")
     }
 }

@@ -9,6 +9,9 @@
 // Config: 1.92B params, inner_dim=2048, 32 heads, head_dim=64
 // Memory at 4-bit: ~0.96 GB
 //
+// Property names match quantized safetensors keys exactly.
+// Top-level prefix: model.diffusion_model.*
+//
 // Reference: diffusers LTXVideoTransformer3DModel
 
 import Foundation
@@ -36,62 +39,33 @@ public struct DiTConfig: Sendable {
     )
 }
 
-// MARK: - Timestep Embedding
+// MARK: - RMS Norm (no learnable weight)
 
-/// Sinusoidal timestep embedding → MLP → AdaLN parameters.
-public class TimestepEmbedding: Module {
-    let linear1: Linear
-    let linear2: Linear
+public class DiTRMSNorm: Module {
+    let eps: Float
 
-    public init(dim: Int = 256, outerDim: Int = 2048) {
-        self.linear1 = Linear(dim, outerDim, bias: true)
-        self.linear2 = Linear(outerDim, outerDim, bias: true)
+    public init(eps: Float = 1e-6) {
+        self.eps = eps
     }
 
-    public func callAsFunction(_ t: MLXArray) -> MLXArray {
-        // Sinusoidal embedding
-        let halfDim: Int = 128  // 256 / 2
-        let freqs: MLXArray = MLXArray(Float(-log(10000.0) / Float(halfDim - 1)))
-        let indices: MLXArray = MLXArray(Array(0..<halfDim).map { Float($0) })
-        let emb: MLXArray = exp(indices * freqs)
-        let tExpanded: MLXArray = expandedDimensions(t.asType(.float32), axis: -1)
-        let sinEmb: MLXArray = sin(tExpanded * emb)
-        let cosEmb: MLXArray = cos(tExpanded * emb)
-        let embedding: MLXArray = concatenated([sinEmb, cosEmb], axis: -1)
-
-        // MLP
-        var h: MLXArray = silu(linear1(embedding))
-        h = silu(linear2(h))
-        return h
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let variance: MLXArray = (x * x).mean(axis: -1, keepDims: true)
+        return x * rsqrt(variance + eps)
     }
 }
 
-/// Full time embedding block that produces 6*innerDim adaLN parameters.
-public class TimeEmbed: Module {
-    let emb: TimestepEmbedder
-    let linear: Linear
+// MARK: - Timestep Embedder
+// Key path: adaln_single.emb.timestep_embedder.{linear_1, linear_2}
 
-    public init(innerDim: Int = 2048) {
-        self.emb = TimestepEmbedder(innerDim: innerDim)
-        self.linear = Linear(innerDim, 6 * innerDim, bias: true)
-    }
-
-    public func callAsFunction(_ t: MLXArray) -> MLXArray {
-        let embedded: MLXArray = emb(t)
-        return linear(embedded)
-    }
-}
-
-/// Timestep embedder sub-module.
-public class TimestepEmbedder: Module {
-    let linear_1: Linear
-    let linear_2: Linear
+public class DiTTimestepEmbedder: Module {
+    let linear_1: QuantizedLinear
+    let linear_2: QuantizedLinear
     let dim: Int
 
     public init(innerDim: Int = 2048) {
         self.dim = 256
-        self.linear_1 = Linear(dim, innerDim, bias: true)
-        self.linear_2 = Linear(innerDim, innerDim, bias: true)
+        self.linear_1 = QuantizedLinear(dim, innerDim, bias: true, groupSize: 64, bits: 4)
+        self.linear_2 = QuantizedLinear(innerDim, innerDim, bias: true, groupSize: 64, bits: 4)
     }
 
     public func callAsFunction(_ t: MLXArray) -> MLXArray {
@@ -108,16 +82,49 @@ public class TimestepEmbedder: Module {
     }
 }
 
-// MARK: - Caption Projection
+// MARK: - AdaLN Emb wrapper
+// Key path: adaln_single.emb.timestep_embedder
 
-/// Projects T5 embeddings (4096-dim) to inner_dim (2048-dim).
-public class CaptionProjection: Module {
-    let linear_1: Linear
-    let linear_2: Linear
+public class DiTAdaLNEmb: Module {
+    let timestep_embedder: DiTTimestepEmbedder
+
+    public init(innerDim: Int = 2048) {
+        self.timestep_embedder = DiTTimestepEmbedder(innerDim: innerDim)
+    }
+
+    public func callAsFunction(_ t: MLXArray) -> MLXArray {
+        return timestep_embedder(t)
+    }
+}
+
+// MARK: - AdaLN Single
+// Key path: adaln_single.{emb, linear}
+
+public class DiTAdaLNSingle: Module {
+    let emb: DiTAdaLNEmb
+    let linear: QuantizedLinear  // innerDim -> 6 * innerDim
+
+    public init(innerDim: Int = 2048) {
+        self.emb = DiTAdaLNEmb(innerDim: innerDim)
+        self.linear = QuantizedLinear(innerDim, 6 * innerDim, bias: true, groupSize: 64, bits: 4)
+    }
+
+    public func callAsFunction(_ t: MLXArray) -> MLXArray {
+        let embedded: MLXArray = emb(t)
+        return linear(embedded)
+    }
+}
+
+// MARK: - Caption Projection
+// Key path: caption_projection.{linear_1, linear_2}
+
+public class DiTCaptionProjection: Module {
+    let linear_1: QuantizedLinear
+    let linear_2: QuantizedLinear
 
     public init(captionChannels: Int = 4096, innerDim: Int = 2048) {
-        self.linear_1 = Linear(captionChannels, innerDim, bias: true)
-        self.linear_2 = Linear(innerDim, innerDim, bias: true)
+        self.linear_1 = QuantizedLinear(captionChannels, innerDim, bias: true, groupSize: 64, bits: 4)
+        self.linear_2 = QuantizedLinear(innerDim, innerDim, bias: true, groupSize: 64, bits: 4)
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -127,29 +134,15 @@ public class CaptionProjection: Module {
     }
 }
 
-// MARK: - DiT RMS Norm
-
-public class DiTRMSNorm: Module {
-    let eps: Float
-
-    public init(eps: Float = 1e-6) {
-        self.eps = eps
-    }
-
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let variance: MLXArray = (x * x).mean(axis: -1, keepDims: true)
-        return x * rsqrt(variance + eps)
-    }
-}
-
 // MARK: - Attention
+// Key path: transformer_blocks.{N}.attn1 or attn2
+// Sub-keys: to_q, to_k, to_v, to_out (array, index 0), norm_q, norm_k
 
-/// Multi-head attention with QK normalization.
 public class DiTAttention: Module {
-    let to_q: Linear
-    let to_k: Linear
-    let to_v: Linear
-    let to_out_0: Linear  // to_out.0
+    let to_q: QuantizedLinear
+    let to_k: QuantizedLinear
+    let to_v: QuantizedLinear
+    let to_out: [QuantizedLinear]  // [0] = output projection
     let norm_q: DiTRMSNorm
     let norm_k: DiTRMSNorm
     let numHeads: Int
@@ -157,10 +150,10 @@ public class DiTAttention: Module {
 
     public init(dim: Int, numHeads: Int = 32, headDim: Int = 64) {
         let innerDim: Int = numHeads * headDim
-        self.to_q = Linear(dim, innerDim, bias: true)
-        self.to_k = Linear(dim, innerDim, bias: true)
-        self.to_v = Linear(dim, innerDim, bias: true)
-        self.to_out_0 = Linear(innerDim, dim, bias: true)
+        self.to_q = QuantizedLinear(dim, innerDim, bias: true, groupSize: 64, bits: 4)
+        self.to_k = QuantizedLinear(dim, innerDim, bias: true, groupSize: 64, bits: 4)
+        self.to_v = QuantizedLinear(dim, innerDim, bias: true, groupSize: 64, bits: 4)
+        self.to_out = [QuantizedLinear(innerDim, dim, bias: true, groupSize: 64, bits: 4)]
         self.norm_q = DiTRMSNorm()
         self.norm_k = DiTRMSNorm()
         self.numHeads = numHeads
@@ -168,10 +161,6 @@ public class DiTAttention: Module {
     }
 
     /// Self-attention or cross-attention.
-    /// - Parameters:
-    ///   - x: query input [B, seqLen, dim]
-    ///   - context: key/value source (nil = self-attention, otherwise cross-attention)
-    ///   - rope: optional RoPE frequencies for self-attention
     public func callAsFunction(_ x: MLXArray, context: MLXArray? = nil,
                                 rope: MLXArray? = nil) -> MLXArray {
         let kv: MLXArray = context ?? x
@@ -179,7 +168,6 @@ public class DiTAttention: Module {
         let sq: Int = x.dim(1)
         let sk: Int = kv.dim(1)
 
-        // Project Q, K, V
         var q: MLXArray = to_q(x).reshaped(b, sq, numHeads, headDim).transposed(0, 2, 1, 3)
         var k: MLXArray = to_k(kv).reshaped(b, sk, numHeads, headDim).transposed(0, 2, 1, 3)
         let v: MLXArray = to_v(kv).reshaped(b, sk, numHeads, headDim).transposed(0, 2, 1, 3)
@@ -196,26 +184,23 @@ public class DiTAttention: Module {
 
         // Scaled dot-product attention
         let scale: Float = 1.0 / sqrt(Float(headDim))
-        var scores: MLXArray = matmul(q, k.transposed(0, 1, 3, 2)) * scale
+        let scores: MLXArray = matmul(q, k.transposed(0, 1, 3, 2)) * scale
         let attnWeights: MLXArray = softmax(scores.asType(.float32), axis: -1).asType(scores.dtype)
         let attnOut: MLXArray = matmul(attnWeights, v)
 
         // Merge heads
         let merged: MLXArray = attnOut.transposed(0, 2, 1, 3).reshaped(b, sq, numHeads * headDim)
-        return to_out_0(merged)
+        return to_out[0](merged)
     }
 
     /// Apply rotary position embeddings.
     private func applyRoPE(_ x: MLXArray, freqs: MLXArray) -> MLXArray {
-        // x: [B, heads, seqLen, headDim]
-        // freqs: [seqLen, headDim/2, 2] or similar
-        // Standard complex rotation: x_rot = x * cos(theta) + rotate_half(x) * sin(theta)
         let halfDim: Int = headDim / 2
         let x1: MLXArray = x[0..., 0..., 0..., 0..<halfDim]
         let x2: MLXArray = x[0..., 0..., 0..., halfDim...]
 
-        let cos_: MLXArray = freqs[0..., 0..., 0]  // cos component
-        let sin_: MLXArray = freqs[0..., 0..., 1]  // sin component
+        let cos_: MLXArray = freqs[0..., 0..., 0]
+        let sin_: MLXArray = freqs[0..., 0..., 1]
 
         let out1: MLXArray = x1 * cos_ - x2 * sin_
         let out2: MLXArray = x2 * cos_ + x1 * sin_
@@ -225,39 +210,63 @@ public class DiTAttention: Module {
 }
 
 // MARK: - Feed-Forward
+// Key path: transformer_blocks.{N}.ff.net.{0,2}
+// net[0] has .proj (gate projection), net[1] is GELU (no params), net[2] is output
 
-public class DiTFeedForward: Module {
-    let proj: Linear   // net.0.proj
-    let out: Linear    // net.2
+/// Gate projection wrapper: ff.net.0.proj
+public class DiTFFNGate: Module {
+    let proj: QuantizedLinear
 
     public init(dim: Int, mlpDim: Int) {
-        self.proj = Linear(dim, mlpDim, bias: true)
-        self.out = Linear(mlpDim, dim, bias: true)
+        self.proj = QuantizedLinear(dim, mlpDim, bias: true, groupSize: 64, bits: 4)
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
-        return out(gelu(proj(x)))
+        return proj(x)
+    }
+}
+
+/// Placeholder for GELU activation at net[1] — no parameters.
+public class DiTFFNActivation: Module {
+    public override init() {
+        super.init()
+    }
+}
+
+/// Feed-forward block: transformer_blocks.{N}.ff
+/// Key path: ff.net.[0].proj, ff.net.[1] (no params), ff.net.[2]
+public class DiTFeedForward: Module {
+    let net: [Module]  // [0]=gate(with .proj), [1]=activation(no params), [2]=output linear
+
+    public init(dim: Int, mlpDim: Int) {
+        self.net = [
+            DiTFFNGate(dim: dim, mlpDim: mlpDim),
+            DiTFFNActivation(),
+            QuantizedLinear(mlpDim, dim, bias: true, groupSize: 64, bits: 4)
+        ]
+    }
+
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let gate: DiTFFNGate = net[0] as! DiTFFNGate
+        let outLinear: QuantizedLinear = net[2] as! QuantizedLinear
+        return outLinear(gelu(gate(x)))
     }
 }
 
 // MARK: - Transformer Block
+// Key path: transformer_blocks.{N}
 
-/// Single DiT block with AdaLN-Single conditioning.
 public class LTXTransformerBlock: Module {
     let scale_shift_table: MLXArray  // [6, innerDim]
     let attn1: DiTAttention          // self-attention
     let attn2: DiTAttention          // cross-attention
     let ff: DiTFeedForward
-    let norm1: DiTRMSNorm            // pre-self-attn
-    let norm2: DiTRMSNorm            // pre-ffn
 
     public init(config: DiTConfig) {
         self.scale_shift_table = MLXArray.zeros([6, config.innerDim])
         self.attn1 = DiTAttention(dim: config.innerDim, numHeads: config.numHeads, headDim: config.headDim)
         self.attn2 = DiTAttention(dim: config.innerDim, numHeads: config.numHeads, headDim: config.headDim)
         self.ff = DiTFeedForward(dim: config.innerDim, mlpDim: config.innerDim * config.mlpRatio)
-        self.norm1 = DiTRMSNorm(eps: config.normEps)
-        self.norm2 = DiTRMSNorm(eps: config.normEps)
     }
 
     /// Forward pass.
@@ -280,9 +289,8 @@ public class LTXTransformerBlock: Module {
         let scaleMLP: MLXArray = params[0..., 4]
         let gateMLP: MLXArray = params[0..., 5]
 
-        // Self-attention with adaLN
-        var h: MLXArray = norm1(x)
-        h = h * expandedDimensions(1 + scaleMSA, axis: 1) + expandedDimensions(shiftMSA, axis: 1)
+        // Self-attention with adaLN (pre-norm is implicit via scale/shift)
+        var h: MLXArray = x * expandedDimensions(1 + scaleMSA, axis: 1) + expandedDimensions(shiftMSA, axis: 1)
         h = attn1(h, rope: rope)
         var out: MLXArray = x + expandedDimensions(gateMSA, axis: 1) * h
 
@@ -290,8 +298,7 @@ public class LTXTransformerBlock: Module {
         out = out + attn2(out, context: textEmbeds)
 
         // Feed-forward with adaLN
-        h = norm2(out)
-        h = h * expandedDimensions(1 + scaleMLP, axis: 1) + expandedDimensions(shiftMLP, axis: 1)
+        h = out * expandedDimensions(1 + scaleMLP, axis: 1) + expandedDimensions(shiftMLP, axis: 1)
         h = ff(h)
         out = out + expandedDimensions(gateMLP, axis: 1) * h
 
@@ -299,26 +306,26 @@ public class LTXTransformerBlock: Module {
     }
 }
 
-// MARK: - Full Transformer Model
+// MARK: - Diffusion Model (inner)
+// Key path: model.diffusion_model.*
+//
+// Peak memory (4-bit): ~0.96 GB
 
-/// LTX-Video DiT: proj_in → 28 transformer blocks → proj_out
-///
-/// Peak memory (4-bit): ~0.96 GB
-public class LTXVideoTransformer: Module {
-    let proj_in: Linear                  // 128 → 2048
-    let proj_out: Linear                 // 2048 → 128
-    let time_embed: TimeEmbed
-    let caption_projection: CaptionProjection
+public class LTXDiffusionModel: Module {
+    let patchify_proj: QuantizedLinear       // 128 -> 2048
+    let proj_out: QuantizedLinear            // 2048 -> 128
+    let adaln_single: DiTAdaLNSingle
+    let caption_projection: DiTCaptionProjection
     let transformer_blocks: [LTXTransformerBlock]
-    let scale_shift_table: MLXArray      // global [2, 2048] for final output
+    let scale_shift_table: MLXArray          // global [2, 2048] for final output
     let config: DiTConfig
 
     public init(config: DiTConfig = .v096) {
         self.config = config
-        self.proj_in = Linear(config.inChannels, config.innerDim, bias: true)
-        self.proj_out = Linear(config.innerDim, config.outChannels, bias: true)
-        self.time_embed = TimeEmbed(innerDim: config.innerDim)
-        self.caption_projection = CaptionProjection(
+        self.patchify_proj = QuantizedLinear(config.inChannels, config.innerDim, bias: true, groupSize: 64, bits: 4)
+        self.proj_out = QuantizedLinear(config.innerDim, config.outChannels, bias: true, groupSize: 64, bits: 4)
+        self.adaln_single = DiTAdaLNSingle(innerDim: config.innerDim)
+        self.caption_projection = DiTCaptionProjection(
             captionChannels: config.captionChannels,
             innerDim: config.innerDim
         )
@@ -340,13 +347,13 @@ public class LTXVideoTransformer: Module {
     public func callAsFunction(latents: MLXArray, textEmbeds: MLXArray,
                                 timestep: MLXArray) -> MLXArray {
         // Project latents to inner dim
-        var hidden: MLXArray = proj_in(latents)
+        var hidden: MLXArray = patchify_proj(latents)
 
         // Project text embeddings
         let projectedText: MLXArray = caption_projection(textEmbeds)
 
-        // Timestep → adaLN parameters
-        let adaln: MLXArray = time_embed(timestep)
+        // Timestep -> adaLN parameters
+        let adaln: MLXArray = adaln_single(timestep)
 
         // TODO: Compute 3D RoPE frequencies from latent spatial dims
         let rope: MLXArray? = nil
@@ -357,8 +364,6 @@ public class LTXVideoTransformer: Module {
         }
 
         // Final adaLN + project out
-        let finalParams: MLXArray = adaln.reshaped(hidden.dim(0), 6, -1)
-        // Use last 2 params from global scale_shift_table for output modulation
         let outShift: MLXArray = scale_shift_table[0]
         let outScale: MLXArray = scale_shift_table[1]
 
@@ -366,5 +371,35 @@ public class LTXVideoTransformer: Module {
         let output: MLXArray = proj_out(hidden)
 
         return output
+    }
+}
+
+// MARK: - Top-level Model wrapper
+// Key path: model.diffusion_model
+
+public class LTXDiffusionModelWrapper: Module {
+    let diffusion_model: LTXDiffusionModel
+
+    public init(config: DiTConfig = .v096) {
+        self.diffusion_model = LTXDiffusionModel(config: config)
+    }
+
+    public func callAsFunction(latents: MLXArray, textEmbeds: MLXArray,
+                                timestep: MLXArray) -> MLXArray {
+        return diffusion_model(latents: latents, textEmbeds: textEmbeds, timestep: timestep)
+    }
+}
+
+/// Matches safetensors root: model.diffusion_model.*
+public class LTXVideoTransformer: Module {
+    let model: LTXDiffusionModelWrapper
+
+    public init(config: DiTConfig = .v096) {
+        self.model = LTXDiffusionModelWrapper(config: config)
+    }
+
+    public func callAsFunction(latents: MLXArray, textEmbeds: MLXArray,
+                                timestep: MLXArray) -> MLXArray {
+        return model(latents: latents, textEmbeds: textEmbeds, timestep: timestep)
     }
 }
