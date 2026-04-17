@@ -41,6 +41,15 @@ struct LTXVideoPadCLI {
             }
         }
 
+        if testName == "pipeline" || testName == "e2e" {
+            let t5Dir = baseDir.appendingPathComponent("Models/t5xxl-encoder-4bit")
+            let vaeDir = baseDir.appendingPathComponent("Models/vae/vae")
+            let ditDir = baseDir.appendingPathComponent("Models/dit-4bit")
+
+            print("\n=== End-to-End Pipeline Test ===")
+            await PipelineTest.run(t5Dir: t5Dir, vaeDir: vaeDir, ditDir: ditDir)
+        }
+
         print("\nMemory: \(MemoryManager.shared.currentMemoryMB) MB")
     }
 }
