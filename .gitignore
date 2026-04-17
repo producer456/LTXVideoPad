@@ -1,0 +1,28 @@
+# Xcode
+build/
+DerivedData/
+*.xcodeproj/project.xcworkspace/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xcuserstate
+xcuserdata/
+
+# Swift Package Manager
+.build/
+Packages/
+Package.resolved
+
+# Model weights (too large for git)
+Models/
+*.safetensors
+*.gguf
+*.mlx
+*.npz
+
+# OS
+.DS_Store
+Thumbs.db
