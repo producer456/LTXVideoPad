@@ -33,7 +33,6 @@ def main():
         import mlx.nn as nn
         from huggingface_hub import snapshot_download
         from safetensors import safe_open
-        from safetensors.torch import save_file
     except ImportError as e:
         print(f"Missing dependency: {e}")
         print("Install with: pip install mlx huggingface_hub safetensors sentencepiece")
@@ -142,27 +141,10 @@ def main():
     print(f"Step 4: Save to {output_dir}")
     print(f"{'=' * 60}")
 
-    # Save as safetensors
+    # Save as safetensors using MLX's built-in save
     output_file = output_dir / "model.safetensors"
-
-    # Convert MLX arrays to numpy for safetensors
-    import numpy as np
-    numpy_weights = {}
-    for key, val in quantized_weights.items():
-        numpy_weights[key] = np.array(val)
-
-    # Use mlx save instead for better compatibility
-    mx.savez(str(output_dir / "weights.npz"), **{k: v for k, v in quantized_weights.items()})
-
-    # Also save as safetensors
-    try:
-        import torch
-        torch_weights = {k: torch.from_numpy(np.array(v)) for k, v in quantized_weights.items()}
-        save_file(torch_weights, str(output_file))
-        print(f"Saved safetensors: {output_file}")
-    except ImportError:
-        print("torch not available, saved as .npz only")
-        print(f"Saved npz: {output_dir / 'weights.npz'}")
+    mx.save_safetensors(str(output_file), quantized_weights)
+    print(f"Saved safetensors: {output_file}")
 
     # Copy tokenizer files
     for pattern in ["*.json", "*.model", "*.txt", "tokenizer*"]:
