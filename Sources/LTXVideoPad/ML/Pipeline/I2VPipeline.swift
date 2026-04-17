@@ -15,6 +15,18 @@ import MLXRandom
 import Tokenizers
 import os
 
+public enum PipelineError: Error, LocalizedError {
+    case thermalAbort
+    case modelNotFound(path: String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .thermalAbort: return "Generation aborted — device overheating"
+        case .modelNotFound(let p): return "Model not found at \(p)"
+        }
+    }
+}
+
 public class I2VPipeline {
     private let logger = Logger(subsystem: "com.ltxvideopad", category: "Pipeline")
     private let memMgr: MemoryManager = .shared
@@ -102,11 +114,13 @@ public class I2VPipeline {
         logger.info("Step 3: DiT denoising — \(ns) steps, seqLen=\(sl)")
         memMgr.willLoad(model: "DiT")
 
-        let denoisedLatents: MLXArray = try denoise(
+        let denoisedLatents: MLXArray = try await denoise(
             noise: initialNoise,
             textEmbeddings: textEmbeddings,
             numSteps: ns
-        )
+        ) { step, total in
+            progress?(3, 4, "Denoising step \(step)/\(total)...")
+        }
         logger.info("Denoised latents: \(denoisedLatents.shape)")
         memMgr.didUnload(model: "DiT")
 
@@ -158,53 +172,76 @@ public class I2VPipeline {
     }
 
     private func denoise(noise: MLXArray, textEmbeddings: MLXArray,
-                          numSteps: Int) throws -> MLXArray {
+                          numSteps: Int,
+                          onStep: ((Int, Int) -> Void)? = nil) async throws -> MLXArray {
         let model = LTXVideoTransformer()
         try loadDiTWeights(model: model, from: ditDir)
 
+        // Optionally merge LoRA if provided
+        if let loraPairs = pendingLoRA {
+            LoRALoader.merge(pairs: loraPairs, into: model, scale: loraScale)
+            logger.info("LoRA merged with scale=\(self.loraScale)")
+        }
+
         let sampler = FlowMatchSampler(numSteps: numSteps)
 
-        // Compute 3D RoPE once for all steps
-        // Peak memory: negligible (~few KB for position embeddings)
         let rope: MLXArray = RoPE3D.build(
-            framesF: latentF,
-            heightH: latentH,
-            widthW: latentW,
-            headDim: 64  // DiTConfig.v096.headDim
+            framesF: latentF, heightH: latentH, widthW: latentW,
+            headDim: 64
         )
         eval(rope)
-        logger.info("3D RoPE: \(rope.shape)")
 
-        // Start from noise
+        // Start thermal monitoring
+        ThermalMonitor.shared.startMonitoring()
+        defer { ThermalMonitor.shared.stopMonitoring() }
+
         var latents = noise
-
         let sigmas = sampler.sigmaSchedule(seqLen: latents.dim(1))
 
         for i in 0..<numSteps {
+            // Thermal check between steps
+            let canContinue = await ThermalMonitor.shared.checkAndWait()
+            guard canContinue else {
+                throw PipelineError.thermalAbort
+            }
+
             let sigma = sigmas[i]
             let sigmaNext = sigmas[i + 1]
             let dt = sigmaNext - sigma
-
             let timestep = MLXArray([sigma * 1000.0])
 
-            // DiT forward: predict velocity (with 3D RoPE)
             let velocity = model(
-                latents: latents,
-                textEmbeds: textEmbeddings,
-                timestep: timestep,
-                rope: rope
+                latents: latents, textEmbeds: textEmbeddings,
+                timestep: timestep, rope: rope
             )
             eval(velocity)
 
-            // Euler step
             latents = latents + MLXArray(dt) * velocity
             eval(latents)
 
-            logger.info("  Step \(i + 1)/\(numSteps): sigma=\(String(format: "%.3f", sigma))")
+            let thermalState = ThermalMonitor.shared.stateString
+            logger.info("  Step \(i + 1)/\(numSteps): sigma=\(String(format: "%.3f", sigma)) thermal=\(thermalState)")
+            onStep?(i + 1, numSteps)
         }
 
-        // Model deallocated when it goes out of scope
         return latents
+    }
+
+    // LoRA support
+    private var pendingLoRA: [LoRAPair]? = nil
+    private var loraScale: Float = 1.0
+
+    /// Set a LoRA to be merged when the DiT is loaded.
+    public func setLoRA(from url: URL, scale: Float = 1.0) throws {
+        self.pendingLoRA = try LoRALoader.load(from: url)
+        self.loraScale = scale
+        logger.info("LoRA queued: \(url.lastPathComponent), \(self.pendingLoRA?.count ?? 0) pairs, scale=\(scale)")
+    }
+
+    /// Clear any pending LoRA.
+    public func clearLoRA() {
+        pendingLoRA = nil
+        loraScale = 1.0
     }
 
     private func decodeLatents(_ latents: MLXArray) throws -> MLXArray {
