@@ -83,9 +83,9 @@ def main():
     all_weights = {}
     for f in safetensors_files:
         print(f"  Loading {f.name}...")
-        with safe_open(str(f), framework="numpy") as sf:
-            for key in sf.keys():
-                all_weights[key] = mx.array(sf.get_tensor(key))
+        # Use MLX's native safetensors loader (handles bfloat16 correctly)
+        shard = mx.load(str(f))
+        all_weights.update(shard)
 
     print(f"Loaded {len(all_weights)} tensors")
 
