@@ -1,26 +1,19 @@
 // T5EncoderTest.swift
 //
-// Phase 1 validation: load T5-XXL encoder, tokenize a prompt, run forward pass,
+// Phase 1 validation: load quantized T5-XXL, tokenize a prompt, forward pass,
 // verify output shape is [1, 128, 4096].
 //
-// Usage: Call T5EncoderTest.run(modelDir:) with the path to quantized weights.
-//
-// Expected output:
-//   Tokenized "a cat walking on grass" -> 7 tokens + EOS + padding = 128
-//   Forward pass output shape: [1, 128, 4096]
-//   First 5 values of output[0,0,:5]: [some floats]
-//   PASS
+// Call from the app: await T5EncoderTest.run(modelDir: URL)
 
 import Foundation
 import MLX
 import MLXNN
+import Tokenizers
 import os
 
 public struct T5EncoderTest {
     private static let logger = Logger(subsystem: "com.ltxvideopad", category: "T5Test")
 
-    /// Run the Phase 1 validation test.
-    /// - Parameter modelDir: URL to directory containing quantized weights + tokenizer
     public static func run(modelDir: URL) async {
         logger.info("=== T5 Encoder Phase 1 Test ===")
         logger.info("Model directory: \(modelDir.path)")
@@ -28,83 +21,91 @@ public struct T5EncoderTest {
         let memMgr: MemoryManager = MemoryManager.shared
         memMgr.logMemory(context: "Before test")
 
-        // Step 1: Load tokenizer
-        logger.info("Step 1: Loading tokenizer...")
-        let tokenizer: T5TokenizerWrapper
-        do {
-            tokenizer = try await T5TokenizerWrapper(from: modelDir)
-            logger.info("Tokenizer loaded successfully")
-        } catch {
-            logger.error("Failed to load tokenizer: \(error.localizedDescription)")
+        // Step 1: Tokenize test prompt
+        logger.info("Step 1: Tokenizing...")
+        let testPrompt: String = "a cat walking on grass"
+
+        let tokenizerFile: URL = modelDir.appendingPathComponent("tokenizer.json")
+        guard FileManager.default.fileExists(atPath: tokenizerFile.path) else {
+            logger.error("tokenizer.json not found at \(tokenizerFile.path)")
             return
         }
 
-        // Step 2: Tokenize test prompt
-        let testPrompt: String = "a cat walking on grass"
-        logger.info("Step 2: Tokenizing '\(testPrompt)'...")
+        let tokenizer: Tokenizer
+        do {
+            let tokData: Data = try Data(contentsOf: tokenizerFile)
+            tokenizer = try JSONDecoder().decode(TokenizerWrapper.self, from: tokData).tokenizer
+        } catch {
+            logger.error("Failed to load tokenizer: \(error)")
+            return
+        }
 
-        let (tokenIds, attentionMask) = tokenizer.encode(testPrompt)
-        let realTokenCount: Int = attentionMask.reduce(0, +)
-        logger.info("Token IDs (first 10): \(tokenIds.prefix(10))")
-        logger.info("Real tokens: \(realTokenCount), padded to: \(tokenIds.count)")
+        let encoded = tokenizer.encode(text: testPrompt)
+        var tokenIds: [Int32] = encoded.map { Int32($0) }
+        tokenIds.append(1) // EOS token
+        let maxLen: Int = 128
 
-        // Step 3: Create model
-        logger.info("Step 3: Creating T5EncoderModel...")
+        // Pad to maxLen
+        while tokenIds.count < maxLen {
+            tokenIds.append(0) // PAD
+        }
+        if tokenIds.count > maxLen {
+            tokenIds = Array(tokenIds.prefix(maxLen))
+        }
+
+        logger.info("Tokenized '\(testPrompt)' -> \(encoded.count) tokens + EOS, padded to \(maxLen)")
+
+        // Step 2: Create model
+        logger.info("Step 2: Creating T5EncoderModel...")
         memMgr.willLoad(model: "T5-XXL")
 
-        let config: T5Config = .xxl
-        let model: T5EncoderModel = T5EncoderModel(config: config)
-        logger.info("Model created with \(config.numLayers) layers, d_model=\(config.dModel)")
+        let model: T5EncoderModel = T5EncoderModel()
+        logger.info("Model created with 24 layers")
 
-        // Step 4: Load weights
-        logger.info("Step 4: Loading weights...")
+        // Step 3: Load weights
+        logger.info("Step 3: Loading quantized weights...")
         do {
-            let weights: [String: MLXArray] = try loadT5Weights(from: modelDir)
-            applyT5Weights(to: model, weights: weights)
-            logger.info("Weights loaded and applied")
+            try loadT5Weights(model: model, from: modelDir)
         } catch {
-            logger.error("Failed to load weights: \(error.localizedDescription)")
+            logger.error("Failed to load weights: \(error)")
             memMgr.didUnload(model: "T5-XXL")
             return
         }
-
         memMgr.logMemory(context: "After weight load")
 
-        // Step 5: Forward pass
-        logger.info("Step 5: Running forward pass...")
-
-        // Convert token IDs to MLXArray: [1, seqLen]
-        let inputIds: MLXArray = MLXArray(tokenIds.map { Int32($0) }).reshaped(1, tokenIds.count)
+        // Step 4: Forward pass
+        logger.info("Step 4: Running forward pass...")
+        let inputIds: MLXArray = MLXArray(tokenIds).reshaped(1, maxLen)
 
         let startTime: Date = Date()
         let output: MLXArray = model(inputIds)
-        // Force evaluation (MLX is lazy)
         eval(output)
         let elapsed: Double = Date().timeIntervalSince(startTime)
 
-        // Step 6: Validate output
-        logger.info("Step 6: Validating output...")
-
+        // Step 5: Validate
         let shape: [Int] = output.shape
+        let expected: [Int] = [1, maxLen, 4096]
+
         logger.info("Output shape: \(shape)")
-        logger.info("Expected:     [1, \(tokenIds.count), \(config.dModel)]")
-        logger.info("Forward pass time: \(String(format: "%.2f", elapsed))s")
+        logger.info("Expected:     \(expected)")
+        logger.info("Time: \(String(format: "%.2f", elapsed))s")
 
-        let expectedShape: [Int] = [1, tokenIds.count, config.dModel]
-        if shape == expectedShape {
-            logger.info("PASS: Output shape matches expected")
-
-            // Print first few values as a sanity check
-            let firstValues: MLXArray = output[0, 0, 0..<5]
-            logger.info("First 5 values of output[0,0,:5]: \(firstValues)")
+        if shape == expected {
+            logger.info("PASS")
         } else {
-            logger.error("FAIL: Expected \(expectedShape), got \(shape)")
+            logger.error("FAIL: shape mismatch")
         }
 
-        // Step 7: Cleanup
         memMgr.didUnload(model: "T5-XXL")
-        memMgr.logMemory(context: "After test cleanup")
-
         logger.info("=== Test Complete ===")
+    }
+}
+
+// Helper to decode tokenizer.json
+private struct TokenizerWrapper: Decodable {
+    let tokenizer: Tokenizer
+
+    init(from decoder: Decoder) throws {
+        self.tokenizer = try Tokenizer(from: decoder)
     }
 }
